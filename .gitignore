@@ -1,0 +1,32 @@
+# Compiled binaries
+scripts/ocr_engine
+*.o
+*.dylib
+*.exe
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.env
+.venv/
+env/
+venv/
+
+# Temp media files
+temp_clip.mp4
+*.mp4
+*.mp3
+*.wav
+*.m4a
+*.json
+!references/*.json
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Logs
+*.log

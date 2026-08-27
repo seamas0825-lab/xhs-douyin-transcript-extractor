@@ -1,0 +1,6 @@
+# Optional cross-platform OCR dependencies for Windows & Linux
+# (macOS uses built-in Apple Vision Framework with zero dependencies)
+
+rapidocr_onnxruntime>=1.3.0; platform_system != "Darwin"
+opencv-python-headless>=4.8.0; platform_system != "Darwin"
+winsdk>=1.0.0b10; platform_system == "Windows"
