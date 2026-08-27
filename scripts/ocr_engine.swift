@@ -36,6 +36,20 @@ guard let videoTrack = asset.tracks(withMediaType: .video).first else {
     exit(1)
 }
 
+// Dynamically compute sample interval for strict 5 fps regardless of source fps (24, 30, 60, 120)
+var sourceFPS: Double = Double(videoTrack.nominalFrameRate)
+if sourceFPS <= 0 {
+    let minDur = videoTrack.minFrameDuration
+    if minDur.timescale > 0 && minDur.value > 0 {
+        sourceFPS = Double(minDur.timescale) / Double(minDur.value)
+    } else {
+        sourceFPS = 30.0
+    }
+}
+
+let targetSampleRate: Double = 5.0 // 5 samples per second
+let sampleInterval = max(1, Int(round(sourceFPS / targetSampleRate)))
+
 let outputSettings: [String: Any] = [
     kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
 ]
@@ -55,7 +69,6 @@ let requestHandler = VNSequenceRequestHandler()
 
 var rawReadings: [(time: Double, text: String)] = []
 var sampleCount = 0
-let sampleInterval = 6 // ~5fps for 30fps
 
 while let sampleBuffer = trackOutput.copyNextSampleBuffer() {
     sampleCount += 1
@@ -76,7 +89,6 @@ while let sampleBuffer = trackOutput.copyNextSampleBuffer() {
         var candidates: [(text: String, y: CGFloat, width: CGFloat)] = []
         for obs in results {
             let text = obs.topCandidates(1).first?.string.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            // Filter noise tokens
             if text.count >= 2 {
                 candidates.append((text: text, y: obs.boundingBox.origin.y, width: obs.boundingBox.size.width))
             }
@@ -96,7 +108,6 @@ func cleanText(_ s: String) -> String {
     return s.components(separatedBy: toRemove).joined()
 }
 
-// Levenshtein distance for accurate sequence similarity
 func levenshteinDistance(_ a: String, _ b: String) -> Int {
     let aChars = Array(a)
     let bChars = Array(b)
@@ -117,9 +128,9 @@ func levenshteinDistance(_ a: String, _ b: String) -> Int {
                 matrix[i][j] = matrix[i - 1][j - 1]
             } else {
                 matrix[i][j] = min(
-                    matrix[i - 1][j] + 1,     // deletion
-                    matrix[i][j - 1] + 1,     // insertion
-                    matrix[i - 1][j - 1] + 1  // substitution
+                    matrix[i - 1][j] + 1,
+                    matrix[i][j - 1] + 1,
+                    matrix[i - 1][j - 1] + 1
                 )
             }
         }

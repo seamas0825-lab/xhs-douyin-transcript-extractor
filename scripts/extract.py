@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-XHS & Douyin Transcript & Subtitle Extractor (v0.2.0)
+XHS & Douyin Transcript & Subtitle Extractor (v0.3.0)
 - Xiaohongshu: Direct SSR / __INITIAL_STATE__ / mediaV2 JSON decoding -> official .srt download.
 - Douyin: Short URL resolving -> TTWID gateway registration -> aweme_detail API -> cla_info (.vtt) or local stream extraction.
-- Multi-track: 
+- Multi-track Architecture:
     1. Official soft subtitles (0.05s instant fast-path)
     2. Local hardware-accelerated OCR (Apple Vision / WinRT / RapidOCR)
-    3. Multimodal frame understanding
-- Zero-leakage: All temporary media files created during local parsing are strictly cleaned up on exit.
-- Security: Default verified TLS context with resilient CA certificates.
+    3. Multimodal frame payload preparation
+- Security: Strict verified TLS (no silent fallback), SSRF domain validation, stream download size cap.
+- Resource Lifecycle: atexit + signal-trap automatic temporary media cleanup.
 """
 
 import sys
@@ -17,27 +17,101 @@ import re
 import json
 import ssl
 import html
+import signal
+import atexit
 import tempfile
 import urllib.parse
 import urllib.request
 import subprocess
 
-def get_secure_ssl_context():
-    """Creates a secure verified TLS context with certifi fallback if needed."""
+# ----------------- CONSTANTS & SECURITY CONFIG -----------------
+
+ALLOWED_DOMAINS = {
+    "xiaohongshu.com",
+    "xhslink.com",
+    "douyin.com",
+    "iesdouyin.com",
+    "douyinvod.com",
+    "byteoversea.com",
+    "ibytedtos.com",
+    "pstatp.com",
+    "bytedance.com",
+    "ixigua.com"
+}
+
+MAX_DOWNLOAD_BYTES = 250 * 1024 * 1024  # 250 MB max limit for stream safety
+DOWNLOAD_CHUNK_SIZE = 1024 * 1024        # 1 MB chunk
+
+DESKTOP_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+MOBILE_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+
+# ----------------- STRICT TLS CONTEXT -----------------
+
+def get_strict_ssl_context():
+    """
+    Creates a strict, verified TLS context using CA certificates.
+    Raises SSLError if certificates cannot be verified.
+    """
     try:
         import certifi
         return ssl.create_default_context(cafile=certifi.where())
     except Exception:
-        pass
-    try:
         return ssl.create_default_context()
+
+ctx = get_strict_ssl_context()
+
+# ----------------- CLEANUP & SIGNAL MANAGEMENT -----------------
+
+temp_files_to_clean = set()
+
+def register_temp_file(filepath: str):
+    if filepath:
+        temp_files_to_clean.add(filepath)
+
+def cleanup_all_temp_files():
+    for tmp_path in list(temp_files_to_clean):
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        temp_files_to_clean.discard(tmp_path)
+
+atexit.register(cleanup_all_temp_files)
+
+def _signal_handler(signum, frame):
+    cleanup_all_temp_files()
+    sys.exit(128 + signum)
+
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
+
+# ----------------- DOMAIN & URL SECURITY -----------------
+
+def is_domain_allowed(url: str) -> bool:
+    """Verifies that the target hostname belongs to authorized platforms."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        hostname = (parsed.hostname or "").lower()
+        if not hostname:
+            return False
+        return any(hostname == allowed or hostname.endswith("." + allowed) for allowed in ALLOWED_DOMAINS)
     except Exception:
-        return ssl._create_unverified_context()
+        return False
 
-ctx = get_secure_ssl_context()
+def validate_and_extract_url(text: str) -> str:
+    """Extracts first HTTP(S) URL and asserts domain legitimacy against SSRF attacks."""
+    url_match = re.search(r'https?://[^\s<>"]+', text)
+    if not url_match:
+        raise ValueError("No valid URL found in input string.")
+    
+    url = url_match.group(0)
+    if not is_domain_allowed(url):
+        parsed = urllib.parse.urlparse(url)
+        raise ValueError(f"Security Error: Domain '{parsed.hostname}' is not in the authorized platform whitelist.")
+    return url
 
-DESKTOP_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-MOBILE_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+# ----------------- PARSERS -----------------
 
 def parse_srt(srt_text: str):
     """Parses SRT format into timestamped cues and clean transcript."""
@@ -104,10 +178,7 @@ def parse_vtt(vtt_text: str):
 
 def extract_xhs(url_or_text: str) -> dict:
     """Extracts XHS video subtitles and metadata."""
-    url_match = re.search(r'https?://[^\s<>"]+', url_or_text)
-    if not url_match:
-        raise ValueError("No valid Xiaohongshu URL found in input")
-    url = url_match.group(0)
+    url = validate_and_extract_url(url_or_text)
 
     req = urllib.request.Request(url, headers={
         "User-Agent": DESKTOP_UA,
@@ -170,16 +241,20 @@ def extract_xhs(url_or_text: str) -> dict:
 
     cues = []
     transcript = ""
-    has_subtitles = False
 
-    if srt_url:
-        srt_req = urllib.request.Request(srt_url, headers={"User-Agent": DESKTOP_UA})
-        with urllib.request.urlopen(srt_req, context=ctx, timeout=10) as s_resp:
-            srt_raw = s_resp.read().decode('utf-8', errors='ignore')
-            cues, transcript = parse_srt(srt_raw)
-            has_subtitles = True
+    if srt_url and is_domain_allowed(srt_url):
+        try:
+            srt_req = urllib.request.Request(srt_url, headers={"User-Agent": DESKTOP_UA})
+            with urllib.request.urlopen(srt_req, context=ctx, timeout=10) as s_resp:
+                srt_raw = s_resp.read().decode('utf-8', errors='ignore')
+                cues, transcript = parse_srt(srt_raw)
+        except Exception:
+            cues, transcript = [], ""
 
-    # Get streams (highest and lowest bitrate)
+    # Crucial Fix: Only consider subtitles valid if cues are not empty
+    has_subtitles = bool(cues)
+
+    # Get stream URLs
     stream_h264 = media_v2.get("video", {}).get("stream", {}).get("h264", [])
     video_stream_url = None
     smallest_stream_url = None
@@ -247,10 +322,7 @@ def get_douyin_ttwid():
 
 def extract_douyin(url_or_text: str) -> dict:
     """Extracts Douyin video metadata and subtitles (cla_info or direct stream)."""
-    url_match = re.search(r'https?://[^\s<>"]+', url_or_text)
-    if not url_match:
-        raise ValueError("No valid Douyin URL found in input")
-    url = url_match.group(0)
+    url = validate_and_extract_url(url_or_text)
 
     # 1. Resolve redirect to get video ID
     req = urllib.request.Request(url, headers={"User-Agent": DESKTOP_UA})
@@ -297,19 +369,23 @@ def extract_douyin(url_or_text: str) -> dict:
     sub_url = None
     cues = []
     transcript = ""
-    has_subtitles = False
 
     if caption_infos:
         sub_url = caption_infos[0].get("url")
-        if sub_url:
-            sub_req = urllib.request.Request(sub_url, headers={"User-Agent": DESKTOP_UA})
-            with urllib.request.urlopen(sub_req, context=ctx, timeout=10) as s_resp:
-                raw_text = s_resp.read().decode('utf-8', errors='ignore')
-                if raw_text.strip().startswith("WEBVTT"):
-                    cues, transcript = parse_vtt(raw_text)
-                else:
-                    cues, transcript = parse_srt(raw_text)
-                has_subtitles = True
+        if sub_url and is_domain_allowed(sub_url):
+            try:
+                sub_req = urllib.request.Request(sub_url, headers={"User-Agent": DESKTOP_UA})
+                with urllib.request.urlopen(sub_req, context=ctx, timeout=10) as s_resp:
+                    raw_text = s_resp.read().decode('utf-8', errors='ignore')
+                    if raw_text.strip().startswith("WEBVTT"):
+                        cues, transcript = parse_vtt(raw_text)
+                    else:
+                        cues, transcript = parse_srt(raw_text)
+            except Exception:
+                cues, transcript = [], ""
+
+    # Crucial Fix: Only consider subtitles valid if cues are not empty
+    has_subtitles = bool(cues)
 
     # Find highest quality & smallest direct stream URLs
     play_addr = video.get("play_addr", {}).get("url_list", [])
@@ -342,6 +418,30 @@ def extract_douyin(url_or_text: str) -> dict:
         "transcript": transcript
     }
 
+# ----------------- STREAM DOWNLOAD WITH LIMITS -----------------
+
+def download_video_stream(stream_url: str, referer: str, dest_path: str):
+    """Downloads video stream with strict MAX_DOWNLOAD_BYTES limit and domain safety."""
+    if not is_domain_allowed(stream_url):
+        raise ValueError(f"Security Error: Stream URL '{stream_url}' not in authorized domain whitelist.")
+    
+    headers = {
+        "User-Agent": DESKTOP_UA,
+        "Referer": referer
+    }
+    req = urllib.request.Request(stream_url, headers=headers)
+    total_bytes = 0
+
+    with urllib.request.urlopen(req, context=ctx, timeout=30) as resp, open(dest_path, "wb") as out_f:
+        while True:
+            chunk = resp.read(DOWNLOAD_CHUNK_SIZE)
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+            if total_bytes > MAX_DOWNLOAD_BYTES:
+                raise ValueError(f"Download exceeded maximum safe limit of {MAX_DOWNLOAD_BYTES // (1024*1024)}MB.")
+            out_f.write(chunk)
+
 # ----------------- MAIN DISPATCHER -----------------
 
 def main():
@@ -350,7 +450,6 @@ def main():
         sys.exit(1)
 
     input_text = " ".join(sys.argv[1:])
-    temp_files_to_clean = []
 
     try:
         if "xiaohongshu.com" in input_text or "xhslink.com" in input_text:
@@ -363,26 +462,25 @@ def main():
             except Exception:
                 result = extract_douyin(input_text)
 
-        # Auto-fallback: If no official soft subtitles found, use local OCR engine (Apple Vision on macOS / WinRT on Windows)
+        # Track 2 Fallback: If no valid subtitles found in Track 1, run Local Hardware OCR
         stream_url = result.get("smallest_stream_url") or result.get("video_stream_url")
         if not result.get("has_subtitles") and stream_url:
             script_dir = os.path.dirname(os.path.abspath(__file__))
             tmp_video = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
-            temp_files_to_clean.append(tmp_video)
+            register_temp_file(tmp_video)
+
             try:
                 referer = "https://www.xiaohongshu.com/" if result.get("platform") == "xiaohongshu" else "https://www.douyin.com/"
-                headers = {
-                    "User-Agent": DESKTOP_UA,
-                    "Referer": referer
-                }
-                req = urllib.request.Request(stream_url, headers=headers)
-                with urllib.request.urlopen(req, context=ctx, timeout=30) as resp, open(tmp_video, "wb") as out_f:
-                    while chunk := resp.read(1024 * 1024):
-                        out_f.write(chunk)
+                download_video_stream(stream_url, referer, tmp_video)
                 
-                # Run cross-platform OCR engine
+                # Execute OCR Processor
                 ocr_processor_path = os.path.join(script_dir, "ocr_processor.py")
-                ocr_res = subprocess.run([sys.executable, ocr_processor_path, tmp_video], capture_output=True, text=True, timeout=180)
+                ocr_res = subprocess.run(
+                    [sys.executable, ocr_processor_path, tmp_video],
+                    capture_output=True,
+                    text=True,
+                    timeout=180
+                )
                 if ocr_res.returncode == 0 and ocr_res.stdout.strip():
                     ocr_data = json.loads(ocr_res.stdout)
                     if ocr_data.get("cues"):
@@ -403,13 +501,7 @@ def main():
         print(json.dumps(error_result, ensure_ascii=False, indent=2))
         sys.exit(1)
     finally:
-        # Strictly clean up any temporary files generated during processing
-        for tmp_path in temp_files_to_clean:
-            if os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
+        cleanup_all_temp_files()
 
 if __name__ == "__main__":
     main()
