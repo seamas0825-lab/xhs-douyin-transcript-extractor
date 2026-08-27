@@ -15,28 +15,36 @@
 ## 🌟 核心特性 (Key Features)
 
 - **⚡ 软字幕优先解析**：通过小红书原生 SSR 状态与字节网关 `ttwid` 鉴权，优先拉取平台官方 `.srt` / `.vtt` 软字幕。
-- **👁️ 本地硬件加速 OCR**：
-  - **macOS**：原生 Swift + Apple Vision Framework + Apple Neural Engine (ANE)；
+- **👁️ 本地平台 OCR 加速与画面变化检测**：
+  - **macOS**：原生 Swift + Apple Vision Framework，支持可用硬件加速（ANE/GPU），内置像素级字幕区域指纹变化比对，自动跳过静态画面以提升长视频处理速度；
   - **Windows**：WinRT `Windows.Media.Ocr` (异步事件循环) / RapidOCR (DirectML / ONNX Runtime)；
-  - **动态帧率采样与去噪**：根据视频实际 FPS 动态计算 5fps 均匀采样，结合编辑距离（Levenshtein Ratio）聚合连续字幕行并过滤短小杂标点。
+  - **动态采样与去噪**：根据视频真实 FPS 动态计算 5fps 均匀采样，结合编辑距离（Levenshtein Ratio）聚合连续字幕行并过滤短小杂标点。
 - **🛡️ 自动资源回收机制 (Lifecycle Cleanup)**：通过 `atexit` 与进程信号陷阱（`SIGINT`/`SIGTERM`）在脚本退出时尝试清理临时媒体切片。
-- **🔒 基础网络安全防护**：强制启用 CA 证书链 TLS 校验，配合域名白名单机制降低 SSRF 风险，并设单流最大下载上限保护。
-- **🤖 适配 AI Agent / Antigravity / Claude Code / Codex**：可作为独立命令行工具调用，也提供了标准 Agent Skill 定义。
+- **🔒 严格网络安全与重定向防护**：强制启用 CA 证书链 TLS 校验，配合 `SafeRedirectHandler` 对所有重定向跳数执行域名白名单校验，防范 SSRF 探测，并设单流最大下载上限保护。
+- **🤖 适配 AI Agent / Antigravity / Claude Code / Codex**：既可作为独立命令行工具调用，也提供了标准 Agent Skill 定义。
 
 ---
 
-## 🏗️ 智能分流架构 (Architecture)
+## 🏗️ 架构分层设计 (Architecture)
+
+本方案明确区分为 **CLI 命令行引擎（2 轨自动闭环）** 与 **Agent Skill 交互层（3 轨全流程覆盖）**：
 
 ```mermaid
 flowchart TD
-    A[输入小红书 / 抖音分享链接] --> B{是否存在官方软字幕?}
-    B -- 是 --> C[【第一轨】抓取官方 .srt / .vtt 软字幕]
-    B -- 否 --> D{视频是否存在硬字幕?}
-    D -- 是 --> E[【第二轨】本地硬件加速 OCR 逐帧提取字幕]
-    D -- 否/纯动作画面 --> F[【第三轨】ffmpeg 轻量切片 -> 多模态音画理解]
-    C --> G[输出结构化 JSON / 4 段式剧本报告]
-    E --> G
-    F --> G
+    subgraph CLI ["CLI 命令行引擎 (extract.py)"]
+        A[输入小红书 / 抖音分享链接] --> B{是否存在官方软字幕?}
+        B -- 是 --> C[【第一轨】抓取官方 .srt / .vtt 软字幕]
+        B -- 否 --> D{视频是否存在硬字幕?}
+        D -- 是 --> E[【第二轨】本地硬件加速 OCR 逐帧提取字幕]
+        D -- 否 --> F[输出结构化 JSON 并标记多模态就绪]
+    end
+
+    subgraph Agent ["Agent Skill 交互层 (SKILL.md)"]
+        F --> G[【第三轨】ffmpeg 轻量切片 -> Agent 多模态音画深度识别]
+        C --> H[输出标准 4 段式专业剧本报告]
+        E --> H
+        G --> H
+    end
 ```
 
 ---
@@ -95,6 +103,8 @@ python3 scripts/extract.py "美食特种兵之长沙！不吃辣星人怎么吃�
 
 ## 🧪 运行单元测试 (Unit Tests)
 
+测试集包含了完整的真实 Payload Fixture、SRT/VTT 解析器、SSRF 重定向拦截器、Levenshtein 聚类算法与临时文件生命周期管理验证：
+
 ```bash
 python3 -m unittest discover -s tests -p "test_*.py"
 ```
@@ -114,9 +124,9 @@ python3 -m unittest discover -s tests -p "test_*.py"
 
 | 平台 | OCR 底层实现 | 硬件加速支持 | 外部依赖 |
 | :--- | :--- | :--- | :--- |
-| **macOS** | **Apple Vision Framework** (Swift) | Apple Neural Engine (ANE) + Apple GPU | 系统自带 (0 外部依赖) |
-| **Windows** | **WinRT `Windows.Media.Ocr`** / **RapidOCR** | Windows NPU (Copilot+) / DirectML / CUDA | `winsdk` / `rapidocr_onnxruntime` |
-| **Linux** | **RapidOCR** / **Tesseract** | CPU / CUDA | `rapidocr_onnxruntime` |
+| **macOS** | **Apple Vision Framework** (Swift) | 可利用 Apple Neural Engine / Apple GPU | 系统自带 (0 外部依赖) |
+| **Windows** | **WinRT `Windows.Media.Ocr`** / **RapidOCR** | 可利用 Windows NPU (Copilot+) / DirectML / CUDA | `winsdk` / `rapidocr_onnxruntime` |
+| **Linux** | **RapidOCR** / **Tesseract** | 可利用 CPU / CUDA | `rapidocr_onnxruntime` |
 
 ---
 

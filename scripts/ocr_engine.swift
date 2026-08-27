@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import Vision
+import CoreVideo
 
 struct SubtitleCue: Codable {
     var start: String
@@ -70,6 +71,61 @@ let requestHandler = VNSequenceRequestHandler()
 var rawReadings: [(time: Double, text: String)] = []
 var sampleCount = 0
 
+// Fast change-detection cache
+var lastFrameSignature: [UInt8] = []
+var lastRecognizedText: String = ""
+
+func computeFrameSignature(pixelBuffer: CVPixelBuffer) -> [UInt8] {
+    CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+    
+    guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+        return []
+    }
+    
+    let width = CVPixelBufferGetWidth(pixelBuffer)
+    let height = CVPixelBufferGetHeight(pixelBuffer)
+    let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+    
+    // Sample a 16x8 grid in the lower 40% subtitle area
+    let startY = Int(Double(height) * 0.55)
+    let endY = Int(Double(height) * 0.95)
+    let gridX = 16
+    let gridY = 8
+    
+    var signature = [UInt8](repeating: 0, count: gridX * gridY)
+    let stepX = max(1, width / gridX)
+    let stepY = max(1, (endY - startY) / gridY)
+    
+    let buffer = baseAddress.assumingMemoryBound(to: UInt8.self)
+    
+    var idx = 0
+    for gy in 0..<gridY {
+        let py = startY + gy * stepY
+        for gx in 0..<gridX {
+            let px = gx * stepX
+            let offset = py * bytesPerRow + px * 4
+            // Extract grayscale luminance (B=0, G=1, R=2)
+            let b = UInt32(buffer[offset])
+            let g = UInt32(buffer[offset + 1])
+            let r = UInt32(buffer[offset + 2])
+            let luma = UInt8((r * 299 + g * 587 + b * 114) / 1000)
+            signature[idx] = luma
+            idx += 1
+        }
+    }
+    return signature
+}
+
+func signatureDiff(sig1: [UInt8], sig2: [UInt8]) -> Double {
+    if sig1.count != sig2.count || sig1.isEmpty { return 1.0 }
+    var totalDiff = 0
+    for i in 0..<sig1.count {
+        totalDiff += abs(Int(sig1[i]) - Int(sig2[i]))
+    }
+    return Double(totalDiff) / Double(sig1.count * 255)
+}
+
 while let sampleBuffer = trackOutput.copyNextSampleBuffer() {
     sampleCount += 1
     if sampleCount % sampleInterval != 0 {
@@ -83,24 +139,37 @@ while let sampleBuffer = trackOutput.copyNextSampleBuffer() {
         continue
     }
     
+    let currentSig = computeFrameSignature(pixelBuffer: pixelBuffer)
+    let diff = signatureDiff(sig1: lastFrameSignature, sig2: currentSig)
+    
+    // If the subtitle band has minimal change (< 2.5% diff), reuse the previous OCR result directly
+    if diff < 0.025 && !lastRecognizedText.isEmpty {
+        rawReadings.append((time: seconds, text: lastRecognizedText))
+        lastFrameSignature = currentSig
+        continue
+    }
+    
     try? requestHandler.perform([textRequest], on: pixelBuffer, orientation: .up)
     
+    var line = ""
     if let results = textRequest.results {
-        var candidates: [(text: String, y: CGFloat, width: CGFloat)] = []
+        var candidates: [(text: String, y: CGFloat)] = []
         for obs in results {
             let text = obs.topCandidates(1).first?.string.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             if text.count >= 2 {
-                candidates.append((text: text, y: obs.boundingBox.origin.y, width: obs.boundingBox.size.width))
+                candidates.append((text: text, y: obs.boundingBox.origin.y))
             }
         }
         
         if !candidates.isEmpty {
-            // Sort by vertical position (prioritize actual bottom subtitle band over upper stickers)
             candidates.sort { $0.y < $1.y }
-            let line = candidates.map { $0.text }.joined(separator: " ")
+            line = candidates.map { $0.text }.joined(separator: " ")
             rawReadings.append((time: seconds, text: line))
         }
     }
+    
+    lastRecognizedText = line
+    lastFrameSignature = currentSig
 }
 
 func cleanText(_ s: String) -> String {

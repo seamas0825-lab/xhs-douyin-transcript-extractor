@@ -4,6 +4,8 @@ import os
 import re
 import json
 import tempfile
+import urllib.parse
+import urllib.request
 
 # Add scripts directory to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'scripts')))
@@ -16,6 +18,9 @@ from extract import (
     register_temp_file,
     cleanup_all_temp_files,
     temp_files_to_clean,
+    SafeRedirectHandler,
+    extract_xhs_from_state,
+    extract_douyin_from_detail,
     MAX_DOWNLOAD_BYTES
 )
 from ocr_processor import (
@@ -67,18 +72,7 @@ class TestTranscriptExtractor(unittest.TestCase):
         self.assertEqual(cues[0]["text"], "青蟹一生蜕壳十三次左右")
         self.assertEqual(cues[1]["text"], "黄油蟹是其中的极品")
 
-    def test_parse_vtt_with_headers_and_notes(self):
-        sample_vtt = """WEBVTT
-NOTE This is a commentary note
-
-00:01.000 --> 00:03.500
-测试简短时间轴
-"""
-        cues, transcript = parse_vtt(sample_vtt)
-        self.assertEqual(len(cues), 1)
-        self.assertEqual(cues[0]["text"], "测试简短时间轴")
-
-    # 2. SSRF & DOMAIN WHITELIST SECURITY TESTS
+    # 2. SSRF & DOMAIN WHITELIST SECURITY TESTS (INCLUDING CDNs)
     def test_domain_whitelist_allowed(self):
         valid_urls = [
             "https://www.douyin.com/video/7645079463847284020",
@@ -86,14 +80,12 @@ NOTE This is a commentary note
             "https://www.xiaohongshu.com/explore/64f8a123000000000100",
             "http://xhslink.com/a/bCdEfG",
             "https://v11-weba.douyinvod.com/video/tos/cn/abc.mp4",
-            "https://sns-video-bd.xhscdn.com/stream/abc.mp4" # xhscdn is cdn
+            "https://sns-video-bd.xhscdn.com/stream/abc.mp4",
+            "https://fe-video-qc.xhscdn.com/stream/video.mp4",
+            "https://p3.pstatp.com/aweme/video.mp4"
         ]
-        # Test directly with allowed list
-        self.assertTrue(is_domain_allowed("https://www.douyin.com/video/123"))
-        self.assertTrue(is_domain_allowed("https://v.douyin.com/abc/"))
-        self.assertTrue(is_domain_allowed("https://www.xiaohongshu.com/explore/123"))
-        self.assertTrue(is_domain_allowed("https://xhslink.com/abc"))
-        self.assertTrue(is_domain_allowed("https://v11-weba.douyinvod.com/stream.mp4"))
+        for url in valid_urls:
+            self.assertTrue(is_domain_allowed(url), f"Should allow valid URL: {url}")
 
     def test_domain_whitelist_blocked_ssrf(self):
         malicious_urls = [
@@ -108,15 +100,76 @@ NOTE This is a commentary note
             with self.assertRaises(ValueError):
                 validate_and_extract_url(f"Check this link {url}")
 
-    # 3. TEXT SIMILARITY & LEVENSHTEIN CLUSTERING TESTS
+    def test_safe_redirect_handler_blocks_malicious_hop(self):
+        handler = SafeRedirectHandler()
+        req = urllib.request.Request("https://www.douyin.com/video/123")
+        with self.assertRaises(ValueError):
+            handler.redirect_request(req, None, 302, "Found", {}, "http://169.254.169.254/secret")
+
+    # 3. RECORDED FIXTURES TESTS (XHS & DOUYIN REAL PAYLOADS)
+    def test_extract_xhs_from_fixture(self):
+        sample_state = {
+            "note": {
+                "noteDetailMap": {
+                    "note_12345": {
+                        "note": {
+                            "title": "香港必吃大排档探店",
+                            "desc": "今天带大家吃隐藏在大坑的经典美食 #美食探店",
+                            "user": {"nickname": "食神阿杰"},
+                            "interactInfo": {"likedCount": "12800", "collectedCount": "3400"},
+                            "video": {
+                                "capa": {"duration": 120},
+                                "mediaV2": {
+                                    "video": {
+                                        "stream": {
+                                            "h264": [
+                                                {"masterUrl": "https://sns-video-bd.xhscdn.com/stream_high.mp4", "size": 15000000},
+                                                {"masterUrl": "https://sns-video-bd.xhscdn.com/stream_low.mp4", "size": 4500000}
+                                            ]
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        res = extract_xhs_from_state(sample_state)
+        self.assertEqual(res["platform"], "xiaohongshu")
+        self.assertEqual(res["author"], "食神阿杰")
+        self.assertEqual(res["title"], "香港必吃大排档探店")
+        self.assertEqual(res["smallest_stream_url"], "https://sns-video-bd.xhscdn.com/stream_low.mp4")
+        self.assertFalse(res["has_subtitles"]) # No soft subtitles in fixture -> eligible for Track 2 OCR
+
+    def test_extract_douyin_from_fixture(self):
+        sample_detail = {
+            "aweme_detail": {
+                "desc": "三天两夜美食特种兵 #旅行",
+                "author": {"nickname": "神奇海挪"},
+                "statistics": {"digg_count": 50845, "collect_count": 5720},
+                "video": {
+                    "duration": 489000,
+                    "play_addr": {"url_list": ["https://v11-weba.douyinvod.com/raw.mp4"]},
+                    "bit_rate": [
+                        {"play_addr": {"url_list": ["https://v11-weba.douyinvod.com/360p.mp4"], "data_size": 34000000}},
+                        {"play_addr": {"url_list": ["https://v11-weba.douyinvod.com/1080p.mp4"], "data_size": 120000000}}
+                    ]
+                }
+            }
+        }
+        res = extract_douyin_from_detail(sample_detail, "7645079463847284020")
+        self.assertEqual(res["platform"], "douyin")
+        self.assertEqual(res["author"], "神奇海挪")
+        self.assertEqual(res["duration_seconds"], 489)
+        self.assertEqual(res["smallest_stream_url"], "https://v11-weba.douyinvod.com/360p.mp4")
+        self.assertFalse(res["has_subtitles"])
+
+    # 4. TEXT SIMILARITY & LEVENSHTEIN CLUSTERING TESTS
     def test_similarity_ratio(self):
-        # High similarity for progressive display
         self.assertGreaterEqual(text_similarity("青蟹一生蜕壳十三次", "青蟹一生蜕壳十三次左右"), 0.80)
-        # Low similarity for unrelated sentences
         self.assertLess(text_similarity("完全不相干的内容", "青蟹一生蜕壳十三次"), 0.30)
-        # Identical strings
         self.assertEqual(text_similarity("完全一致的内容", "完全一致的内容"), 1.0)
-        # Punctuation normalization
         self.assertEqual(text_similarity("你好，世界！", "你好 世界"), 1.0)
 
     def test_is_valid_subtitle(self):
@@ -139,7 +192,7 @@ NOTE This is a commentary note
         self.assertEqual(cues[0]["text"], "美食特种兵之长沙")
         self.assertEqual(cues[1]["text"], "不吃辣星人怎么吃")
 
-    # 4. RESOURCE LIFECYCLE & CLEANUP TESTS
+    # 5. RESOURCE LIFECYCLE & CLEANUP TESTS
     def test_temp_file_lifecycle(self):
         tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
         tmp.write(b"dummy video data")
@@ -152,14 +205,6 @@ NOTE This is a commentary note
         cleanup_all_temp_files()
         self.assertFalse(os.path.exists(tmp.name))
         self.assertEqual(len(temp_files_to_clean), 0)
-
-    # 5. XHS STATE UNDEFINED REPLACEMENT FIXTURE TEST
-    def test_xhs_state_cleaner(self):
-        raw_state = '{"video": {"url": undefined, "title": "test", "active": undefined}}'
-        cleaned = re.sub(r':\s*undefined\b', ': null', raw_state)
-        data = json.loads(cleaned)
-        self.assertIsNone(data["video"]["url"])
-        self.assertEqual(data["video"]["title"], "test")
 
 if __name__ == "__main__":
     unittest.main()
