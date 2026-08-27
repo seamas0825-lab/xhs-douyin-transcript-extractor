@@ -15,14 +15,14 @@ struct OCRResult: Codable {
 }
 
 guard CommandLine.arguments.count > 1 else {
-    fputs("Usage: ocr_engine <video_path_or_url>\n", stderr)
+    fputs("Usage: ocr_engine <video_path>\n", stderr)
     exit(1)
 }
 
 let videoInput = CommandLine.arguments[1]
 let videoURL = URL(fileURLWithPath: videoInput)
 
-let asset = AVAsset(url: videoURL)
+let asset = AVURLAsset(url: videoURL)
 let reader: AVAssetReader
 do {
     reader = try AVAssetReader(asset: asset)
@@ -48,7 +48,7 @@ let textRequest = VNRecognizeTextRequest()
 textRequest.recognitionLanguages = ["zh-Hans", "zh-Hant", "en-US"]
 textRequest.recognitionLevel = .accurate
 textRequest.usesLanguageCorrection = true
-// Cover the lower 55% of the video to handle both 16:9 horizontal and 9:16 vertical video subtitle layouts
+// Focus on lower 55% of the frame (covers 16:9 bottom subtitles & 9:16 vertical video subtitle bands)
 textRequest.regionOfInterest = CGRect(x: 0.02, y: 0.01, width: 0.96, height: 0.55)
 
 let requestHandler = VNSequenceRequestHandler()
@@ -73,17 +73,17 @@ while let sampleBuffer = trackOutput.copyNextSampleBuffer() {
     try? requestHandler.perform([textRequest], on: pixelBuffer, orientation: .up)
     
     if let results = textRequest.results {
-        var candidates: [(text: String, y: CGFloat)] = []
+        var candidates: [(text: String, y: CGFloat, width: CGFloat)] = []
         for obs in results {
             let text = obs.topCandidates(1).first?.string.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            // Filter noise
+            // Filter noise tokens
             if text.count >= 2 {
-                candidates.append((text: text, y: obs.boundingBox.origin.y))
+                candidates.append((text: text, y: obs.boundingBox.origin.y, width: obs.boundingBox.size.width))
             }
         }
         
         if !candidates.isEmpty {
-            // Sort by vertical position (bottom-most subtitle line)
+            // Sort by vertical position (prioritize actual bottom subtitle band over upper stickers)
             candidates.sort { $0.y < $1.y }
             let line = candidates.map { $0.text }.joined(separator: " ")
             rawReadings.append((time: seconds, text: line))
@@ -92,11 +92,39 @@ while let sampleBuffer = trackOutput.copyNextSampleBuffer() {
 }
 
 func cleanText(_ s: String) -> String {
-    return s.replacingOccurrences(of: " ", with: "")
-        .replacingOccurrences(of: "，", with: "")
-        .replacingOccurrences(of: "。", with: "")
-        .replacingOccurrences(of: "！", with: "")
-        .replacingOccurrences(of: "？", with: "")
+    let toRemove = CharacterSet(charactersIn: " ，。！？、：；“”‘’\"'()[]-~")
+    return s.components(separatedBy: toRemove).joined()
+}
+
+// Levenshtein distance for accurate sequence similarity
+func levenshteinDistance(_ a: String, _ b: String) -> Int {
+    let aChars = Array(a)
+    let bChars = Array(b)
+    let m = aChars.count
+    let n = bChars.count
+    
+    if m == 0 { return n }
+    if n == 0 { return m }
+    
+    var matrix = [[Int]](repeating: [Int](repeating: 0, count: n + 1), count: m + 1)
+    
+    for i in 0...m { matrix[i][0] = i }
+    for j in 0...n { matrix[0][j] = j }
+    
+    for i in 1...m {
+        for j in 1...n {
+            if aChars[i - 1] == bChars[j - 1] {
+                matrix[i][j] = matrix[i - 1][j - 1]
+            } else {
+                matrix[i][j] = min(
+                    matrix[i - 1][j] + 1,     // deletion
+                    matrix[i][j - 1] + 1,     // insertion
+                    matrix[i - 1][j - 1] + 1  // substitution
+                )
+            }
+        }
+    }
+    return matrix[m][n]
 }
 
 func similarity(_ a: String, _ b: String) -> Double {
@@ -106,11 +134,10 @@ func similarity(_ a: String, _ b: String) -> Double {
     if ca.isEmpty || cb.isEmpty { return 0.0 }
     if ca.contains(cb) || cb.contains(ca) { return 0.85 }
     
-    let setA = Set(ca)
-    let setB = Set(cb)
-    let intersection = setA.intersection(setB).count
-    let union = setA.union(setB).count
-    return Double(intersection) / Double(union)
+    let maxLen = max(ca.count, cb.count)
+    if maxLen == 0 { return 1.0 }
+    let dist = levenshteinDistance(ca, cb)
+    return 1.0 - (Double(dist) / Double(maxLen))
 }
 
 func formatTime(_ sec: Double) -> String {
@@ -131,24 +158,29 @@ var cues: [RawCue] = []
 var currentCue: RawCue? = nil
 
 for reading in rawReadings {
+    let cleaned = cleanText(reading.text)
+    if cleaned.count < 2 {
+        continue
+    }
+    
     if let cur = currentCue {
         let sim = similarity(cur.text, reading.text)
         let timeDiff = reading.time - cur.endTime
         
-        if sim >= 0.65 && timeDiff <= 1.2 {
+        if sim >= 0.60 && timeDiff <= 1.2 {
             var updatedText = cur.text
             if reading.text.count > cur.text.count {
                 updatedText = reading.text
             }
-            currentCue = RawCue(startTime: cur.startTime, endTime: reading.time + 0.2, text: updatedText)
+            currentCue = RawCue(startTime: cur.startTime, endTime: reading.time + 0.25, text: updatedText)
         } else {
             if cur.endTime - cur.startTime >= 0.25 {
                 cues.append(cur)
             }
-            currentCue = RawCue(startTime: reading.time, endTime: reading.time + 0.2, text: reading.text)
+            currentCue = RawCue(startTime: reading.time, endTime: reading.time + 0.25, text: reading.text)
         }
     } else {
-        currentCue = RawCue(startTime: reading.time, endTime: reading.time + 0.2, text: reading.text)
+        currentCue = RawCue(startTime: reading.time, endTime: reading.time + 0.25, text: reading.text)
     }
 }
 

@@ -1,14 +1,15 @@
 # ⚡ XHS & Douyin Transcript Extractor (小红书/抖音极速字幕与剧本提取大师)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![CI & Quality Gate](https://github.com/seamas0825-lab/xhs-douyin-transcript-extractor/actions/workflows/ci.yml/badge.svg)](https://github.com/seamas0825-lab/xhs-douyin-transcript-extractor/actions)
 [![macOS](https://img.shields.io/badge/macOS-Apple%20Vision%20%2B%20ANE-black.svg?logo=apple)](https://developer.apple.com/documentation/vision)
 [![Windows](https://img.shields.io/badge/Windows-WinRT%20%2B%20DirectML-0078D6.svg?logo=windows)](https://learn.microsoft.com/en-us/uwp/api/windows.media.ocr)
-[![Zero Token Overhead](https://img.shields.io/badge/Token%20Savings-99%25%2B-brightgreen.svg)](#-为什么选择本项目)
-[![Zero Hallucination](https://img.shields.io/badge/Zero-Hallucination-red.svg)](#-核心原则与安全红线)
+[![Zero Token Waste](https://img.shields.io/badge/Token%20Savings-99%25%2B-brightgreen.svg)](#-为什么选择本项目)
+[![Zero Hallucination](https://img.shields.io/badge/Policy-Zero--Hallucination-red.svg)](#-核心原则与安全红线)
 
-一键提取 **小红书（RED）** 与 **抖音（Douyin）** 视频的原生带毫秒时间戳字幕（SRT/WebVTT）、高清无水印直链与口播分镜剧本。
+一键提取 **小红书（RED）** 与 **抖音（Douyin）** 视频的原生带时间戳字幕（SRT/WebVTT）、高清无水印直链与口播分镜剧本。
 
-小红书直取官方 `mediaV2` 软字幕，抖音优先提取 CC 软字幕；遇到无软字幕视频时，自动调用本地原生硬件加速引擎（macOS **Apple Vision Framework** / Windows **WinRT OCR**）逐帧毫秒级提取硬字幕，彻底消除 AI 脑补与漏字风险。
+小红书直取官方 `mediaV2` 软字幕，抖音优先提取 CC 软字幕；遇到无软字幕视频时，自动调用本地原生硬件加速引擎（macOS **Apple Vision Framework** / Windows **WinRT OCR**）逐帧毫秒级提取硬字幕，彻底消除大模型盲目看视频带来的幻觉脑补与漏字风险。
 
 ---
 
@@ -17,9 +18,10 @@
 - **⚡ 软字幕秒级直取（0.05s）**：通过小红书原生 SSR 水合解析与字节网关 `ttwid` 协议免登陆秒级直取官方 `.srt` 软字幕。
 - **👁️ 本地硬件加速 OCR（零 Token 浪费）**：
   - **macOS**：原生 Swift + Apple Vision Framework + Apple Neural Engine (ANE) 硬件加速；
-  - **Windows**：原生 WinRT `Windows.Media.Ocr` / RapidOCR (DirectML / ONNX Runtime)；
-  - **100% 字字精准**：绝不脑补台词、价格或菜单，时间轴毫秒级严丝合缝。
+  - **Windows**：原生 WinRT `Windows.Media.Ocr` (支持 Copilot+ NPU) / RapidOCR (DirectML / ONNX Runtime)；
+  - **高保真字幕去噪**：基于编辑距离（Levenshtein Ratio）与动态字幕带位置过滤，有效剔除表情贴纸与 UI 杂音。
 - **🛡️ 零磁盘泄漏（Zero-Leakage Cleanup）**：所有本地临时切片与缓存数据均在提取完成后瞬间销毁，本地磁盘 0 残留。
+- **🔒 严格网络安全**：默认强制启用 CA 证书链 TLS 校验，拒绝不安全连接。
 - **🤖 完美适配 AI Agent / Antigravity / Claude Code / Codex**：既可作为独立命令行工具使用，也可作为标准 Agent Skill 即插即用。
 
 ---
@@ -55,7 +57,7 @@ swiftc -O -o scripts/ocr_engine scripts/ocr_engine.swift
 chmod +x scripts/ocr_engine
 ```
 
-*(Windows 用户可直接运行 `pip install -r requirements.txt`)*
+*(Windows / Linux 用户可直接运行 `pip install -r requirements.txt`)*
 
 ### 3. 一键提取视频字幕与口播
 ```bash
@@ -89,6 +91,14 @@ python3 scripts/extract.py "美食特种兵之长沙！不吃辣星人怎么吃�
   ],
   "transcript": "美食特种兵之三天两夜 长沙人是不是喝得太好了..."
 }
+```
+
+---
+
+## 🧪 运行单元测试 (Unit Tests)
+
+```bash
+python3 -m unittest discover -s tests -p "test_*.py"
 ```
 
 ---
